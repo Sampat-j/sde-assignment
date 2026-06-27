@@ -38,6 +38,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict
 
+from flask import ctx
+
 from src.tasks.celery_app import celery_app
 from src.services.post_call_processor import PostCallProcessor, PostCallContext
 from src.services.recording import fetch_and_upload_recording
@@ -152,16 +154,41 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         interaction_id=interaction_id,
         event="RECORDING_UPLOAD_STARTED",
     )
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
+
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="LLM_ANALYSIS_STARTED",
+    )
+
+    processor = PostCallProcessor()
+
+    recording_task = asyncio.create_task(
+        fetch_and_upload_recording(
+            interaction_id=ctx.interaction_id,
+            call_sid=ctx.call_sid,
+            exotel_account_id=ctx.exotel_account_id or "",
+        )
+    )
+
+    analysis_task = asyncio.create_task(
+        processor.process_post_call(
+            ctx,
+            single_prompt=True,
+        )
+    )
+
+    recording_s3_key, result = await asyncio.gather(
+        recording_task,
+        analysis_task,
     )
 
     if recording_s3_key:
         logger.info(
             "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
+            extra={
+                "interaction_id": interaction_id,
+                "s3_key": recording_s3_key,
+            },
         )
 
     audit_logger.log(
@@ -170,30 +197,12 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         s3_key=recording_s3_key,
     )
 
-        
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
-
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    audit_logger.log(
-        interaction_id=interaction_id,
-        event="LLM_ANALYSIS_STARTED",
-    )
-    
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
-
     await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+        interaction_id,
+        result.tokens_used,
+        result.latency_ms,
     )
+
     audit_logger.log(
         interaction_id=interaction_id,
         event="LLM_ANALYSIS_COMPLETED",
