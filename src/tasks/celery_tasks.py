@@ -44,6 +44,7 @@ from src.services.recording import fetch_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.services.retry_queue import retry_queue
 from src.services.metrics import metrics_tracker
+from src.services.audit.logger import audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,16 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
     try:
         loop.run_until_complete(_process_interaction(self, payload))
     except Exception as e:
+
+        audit_logger.log(
+            interaction_id=payload["interaction_id"],
+            customer_id=payload.get("customer_id"),
+            campaign_id=payload.get("campaign_id"),
+            event="POSTCALL_PROCESSING_FAILED",
+            error=str(e),
+            retry_attempt=self.request.retries,
+        )
+
         logger.exception(
             "celery_task_failed",
             extra={
@@ -105,6 +116,13 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
 async def _process_interaction(task, payload: Dict[str, Any]):
     interaction_id = payload["interaction_id"]
 
+    audit_logger.log(
+            interaction_id=interaction_id,
+            customer_id=payload["customer_id"],
+            campaign_id=payload["campaign_id"],
+            event="POSTCALL_PROCESSING_STARTED",
+        )
+
     await metrics_tracker.track_processing_started(interaction_id)
 
     ctx = PostCallContext(
@@ -129,6 +147,11 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     #
     # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
     # Sometimes they arrive after 60s. We've already given up by then.
+
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="RECORDING_UPLOAD_STARTED",
+    )
     recording_s3_key = await fetch_and_upload_recording(
         interaction_id=ctx.interaction_id,
         call_sid=ctx.call_sid,
@@ -140,6 +163,14 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             "recording_uploaded",
             extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
         )
+
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="RECORDING_UPLOAD_COMPLETED",
+        s3_key=recording_s3_key,
+    )
+
+        
     # If recording_s3_key is None, we continue silently. No alert, no retry,
     # no flag on the interaction. The recording is just gone.
 
@@ -152,11 +183,22 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     # this call. If we're over the limit, the provider returns a 429 and this
     # raises an exception, which triggers Celery retry — which goes to the back
     # of the 100K-item queue and makes the problem worse.
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="LLM_ANALYSIS_STARTED",
+    )
+    
     processor = PostCallProcessor()
     result = await processor.process_post_call(ctx, single_prompt=True)
 
     await metrics_tracker.track_processing_completed(
         interaction_id, result.tokens_used, result.latency_ms
+    )
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="LLM_ANALYSIS_COMPLETED",
+        tokens_used=result.tokens_used,
+        latency_ms=result.latency_ms,
     )
 
     # ── Step 3: Signal jobs ───────────────────────────────────────────────────
@@ -165,6 +207,11 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     #
     # If this raises, we log a warning and continue — the lead stage still
     # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="SIGNAL_JOBS_STARTED",
+    )
+    
     try:
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
@@ -179,6 +226,10 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     # Updates the lead's stage in the leads table based on call_stage.
     # e.g., "rebook_confirmed" → lead moves to "booked" stage.
     # Same fire-and-forget risk as signal_jobs above.
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="LEAD_STAGE_UPDATE_STARTED",
+    )
     try:
         await update_lead_stage(
             lead_id=ctx.lead_id,
@@ -187,3 +238,8 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         )
     except Exception as e:
         logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+
+    audit_logger.log(
+        interaction_id=interaction_id,
+        event="POSTCALL_PROCESSING_COMPLETED",
+    )

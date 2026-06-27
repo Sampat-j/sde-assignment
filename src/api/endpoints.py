@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.tasks.celery_tasks import process_interaction_end_background_task
+from src.services.audit.logger import audit_logger
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -91,6 +92,13 @@ async def end_interaction(
             ended_at=datetime.utcnow(),
             duration=request.duration_seconds,
             call_sid=request.call_sid,
+        )
+
+        audit_logger.log(
+            interaction_id=str(interaction_id),
+            customer_id=interaction["customer_id"],
+            campaign_id=interaction["campaign_id"],
+            event="INTERACTION_ENDED",
         )
 
         transcript = interaction.get("conversation_data", {}).get("transcript", [])
@@ -154,6 +162,14 @@ async def end_interaction(
                 queue="postcall_processing",  # One queue to rule them all
             )
 
+            audit_logger.log(
+                interaction_id=str(interaction_id),
+                customer_id=interaction["customer_id"],
+                campaign_id=interaction["campaign_id"],
+                event="POSTCALL_TASK_ENQUEUED",
+                celery_task_id=task.id,
+            )
+
             logger.info(
                 "postcall_enqueued",
                 extra={
@@ -193,6 +209,13 @@ async def end_interaction(
     except HTTPException:
         raise
     except Exception as e:
+
+        audit_logger.log(
+            interaction_id=str(interaction_id),
+            event="END_INTERACTION_FAILED",
+            error=str(e),
+        )
+        
         logger.exception(
             "end_interaction_failed",
             extra={"interaction_id": str(interaction_id), "error": str(e)},
