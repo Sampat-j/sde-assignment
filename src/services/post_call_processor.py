@@ -27,13 +27,16 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
+from flask import ctx
+
 from src.config import settings
 from src.services.circuit_breaker import circuit_breaker
+from src.services.rate_limit.scheduler import llm_scheduler
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass  
 class PostCallContext:
     """Everything needed to process one completed call."""
     interaction_id: str
@@ -105,8 +108,17 @@ class PostCallProcessor:
             )
 
             start_time = datetime.utcnow()
-            response = await self._call_llm(prompt)
-            elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
+
+            response = await llm_scheduler.execute(
+                customer_id=ctx.customer_id,
+                estimated_tokens=settings.LLM_AVG_TOKENS_PER_CALL,
+                llm_callable=self._call_llm,
+                prompt=prompt,
+            )
+
+            elapsed_ms = (
+                datetime.utcnow() - start_time
+            ).total_seconds() * 1000
 
             result = self._parse_response(response, elapsed_ms)
 
