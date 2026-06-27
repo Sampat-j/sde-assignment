@@ -112,26 +112,6 @@ async def end_interaction(
                 "short_transcript_fast_path",
                 extra={"interaction_id": str(interaction_id)},
             )
-
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="short_call",
-                )
-            )
-
         else:
             # Long transcript: pack everything into a Celery payload and enqueue.
             # All calls get the same queue, same priority, same processing path —
@@ -215,7 +195,7 @@ async def end_interaction(
             event="END_INTERACTION_FAILED",
             error=str(e),
         )
-        
+
         logger.exception(
             "end_interaction_failed",
             extra={"interaction_id": str(interaction_id), "error": str(e)},
