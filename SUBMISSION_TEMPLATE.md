@@ -1,6 +1,6 @@
 # Post-Call Processing Pipeline — Design Document
 
-**Author:** Your Name
+**Author:** Sampat Janagond
 **Date:** June 27, 2026
 
 ---
